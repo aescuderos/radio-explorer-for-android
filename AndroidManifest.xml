@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.radioexplorer">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries>
+        <package android:name="org.videolan.vlc" />
+        <intent><action android:name="android.intent.action.VIEW" /><data android:mimeType="audio/*" /></intent>
+    </queries>
+    <application android:label="Radio Explorer" android:icon="@drawable/icon"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:usesCleartextTraffic="true" android:allowBackup="false"
+        android:supportsRtl="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
