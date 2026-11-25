@@ -1,8 +1,11 @@
 """On-device UI smoke test. Requires an unlocked device and an installed APK."""
 import os
+import json
 import re
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 
 
@@ -45,7 +48,7 @@ def press(text):
 
 def ready():
     return wait_for(
-        lambda t: any("emisoras · operativas" in n.get("text", "") for n in t),
+        lambda t: any("emisoras cargadas · operativas" in n.get("text", "") for n in t),
         "Catalogue did not load",
     )
 
@@ -75,30 +78,67 @@ def query(value):
     press("Buscar")
 
 
+def outside_first_page():
+    base = "https://de1.api.radio-browser.info/json/stations/search?"
+    def search(**kwargs):
+        params = dict(countrycode="ES", hidebroken="true", order="clickcount", reverse="true", **kwargs)
+        request = urllib.request.Request(base + urllib.parse.urlencode(params), headers={"User-Agent": "RadioExplorer/1.3"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    first = {s["name"] for s in search(limit=100)}
+    for station in search(limit=100, offset=200):
+        name = station["name"]
+        if name not in first and re.fullmatch(r"[A-Za-z0-9 ]{8,30}", name):
+            found = search(name=name, limit=1)
+            if found and found[0]["name"] == name:
+                return name
+    raise AssertionError("Could not find a searchable station outside the first page")
+
+
+def swipe_list():
+    tree = nodes()
+    view = next(n for n in tree if n.get("class") == "android.widget.ListView")
+    x1, y1, x2, y2 = map(int, re.findall(r"\d+", view.get("bounds")))
+    x = str((x1 + x2) // 2)
+    adb("shell", "input", "swipe", x, str(y2 - 30), x, str(y1 + 30), "180")
+
+
 def run():
     adb("shell", "am", "force-stop", "com.radioexplorer")
     adb("shell", "am", "start", "-n", "com.radioexplorer/.MainActivity")
     tree = ready()
-    assert has_text(tree, "100 emisoras · operativas según Radio Browser")
-    press("Cargar más")
-    tree = wait_for(
-        lambda t: has_text(t, "200 emisoras · operativas según Radio Browser"),
-        "Pagination did not append the next page",
-    )
+    assert has_text(tree, "100 emisoras cargadas · operativas según Radio Browser")
+    assert not has_text(tree, "Mostrar más emisoras")
+    tap(next(n for n in tree if n.get("content-desc") == "Información"))
+    wait_for(lambda t: has_text(t, "Radio Explorer") and has_text(t, "LICENCIA LIBVLC"),
+             "Information icon did not open the information dialog")
+    press("ACEPTAR")
+    deep_name = outside_first_page()
+    query(deep_name)
+    wait_for(lambda t: has_text(t, deep_name), "Search did not find a station outside the first page")
+    query("")
+    ready()
+    for _ in range(35):
+        tree = nodes()
+        if any(re.match(r"^(?:2\d\d|[3-9]\d\d) emisoras cargadas", n.get("text", "")) for n in tree):
+            break
+        swipe_list()
+    else:
+        raise AssertionError("Infinite scroll did not append the next page")
     star = next(n for n in tree if n.get("content-desc", "").startswith("Añadir a favoritos: "))
     station = star.get("content-desc").split(": ", 1)[1]
     tap(star)
-    press("☆ Favoritos")
+    press("Favoritos")
     wait_for(lambda t: has_text(t, station), "Favorite did not appear")
 
     adb("shell", "am", "force-stop", "com.radioexplorer")
     adb("shell", "am", "start", "-n", "com.radioexplorer/.MainActivity")
     ready()
-    press("☆ Favoritos")
+    press("Favoritos")
     tree = wait_for(lambda t: has_text(t, station), "Favorite did not survive restart")
     tap(next(n for n in tree if n.get("content-desc") == "Quitar de favoritos: " + station))
     wait_for(lambda t: not has_text(t, station), "Favorite was not removed")
-    press("★ Favoritos")
+    press("Ver todas")
     ready()
 
     query("RadioExplorerNoSuchStation938271")

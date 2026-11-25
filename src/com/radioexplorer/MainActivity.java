@@ -2,24 +2,31 @@ package com.radioexplorer;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.ActivityNotFoundException;
+import android.Manifest;
+import android.content.ComponentName;
+import android.content.ServiceConnection;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
-import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.BaseAdapter;
+import android.widget.AbsListView;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -28,6 +35,8 @@ import org.json.JSONArray;
 import org.json.JSONException;
 
 import java.io.IOException;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.text.Collator;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -51,11 +60,28 @@ public class MainActivity extends Activity {
     private final StationAdapter adapter = new StationAdapter();
     private SharedPreferences prefs;
     private String country, query, tag;
-    private boolean onlyFavorites, loading, hasMore, destroyed;
+    private boolean onlyFavorites, loading, hasMore, loadError, destroyed;
     private int generation, offset;
     private EditText search;
     private TextView status;
-    private Button countryButton, favoriteButton, genreButton, more;
+    private Button countryButton, favoriteButton, genreButton;
+    private ListView list;
+    private TextView listFooter;
+    private LinearLayout playerBar;
+    private TextView playerTitle;
+    private ImageButton playerToggle;
+    private PlaybackService playback;
+    private boolean bound;
+    private final ServiceConnection connection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            playback = ((PlaybackService.LocalBinder) binder).service();
+            playback.observe(() -> updatePlayer());
+        }
+        @Override public void onServiceDisconnected(ComponentName name) {
+            playback = null;
+            updatePlayer();
+        }
+    };
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -101,6 +127,25 @@ public class MainActivity extends Activity {
         return b;
     }
 
+    private ImageButton iconButton(int icon, String label, View.OnClickListener action) {
+        ImageButton button = new ImageButton(this);
+        TypedValue background = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, background, true);
+        button.setBackgroundResource(background.resourceId);
+        button.setImageResource(icon);
+        button.setContentDescription(label);
+        button.setPadding(dp(12), dp(12), dp(12), dp(12));
+        button.setOnClickListener(action);
+        return button;
+    }
+
+    private void updateFavoriteFilter() {
+        favoriteButton.setText(onlyFavorites ? "Ver todas" : "Favoritos");
+        favoriteButton.setCompoundDrawablesWithIntrinsicBounds(
+                onlyFavorites ? R.drawable.ic_favorite_on : R.drawable.ic_favorite_off, 0, 0, 0);
+        favoriteButton.setCompoundDrawablePadding(dp(6));
+    }
+
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -112,8 +157,8 @@ public class MainActivity extends Activity {
         TextView name = text("Radio Explorer", 27, ACCENT);
         name.setTypeface(null, Typeface.BOLD);
         title.addView(name, new LinearLayout.LayoutParams(0, dp(52), 1));
-        Button info = button("Info", v -> about());
-        title.addView(info);
+        ImageButton info = iconButton(R.drawable.ic_info, "Información", v -> about());
+        title.addView(info, new LinearLayout.LayoutParams(dp(48), dp(48)));
         root.addView(title);
 
         LinearLayout searchRow = new LinearLayout(this);
@@ -137,11 +182,12 @@ public class MainActivity extends Activity {
 
         LinearLayout filters = new LinearLayout(this);
         countryButton = button(countryName(country), v -> chooseCountry());
-        favoriteButton = button(onlyFavorites ? "★ Favoritos" : "☆ Favoritos", v -> {
+        favoriteButton = button("", v -> {
             onlyFavorites = !onlyFavorites;
-            favoriteButton.setText(onlyFavorites ? "★ Favoritos" : "☆ Favoritos");
+            updateFavoriteFilter();
             refresh();
         });
+        updateFavoriteFilter();
         filters.addView(countryButton, new LinearLayout.LayoutParams(0, dp(52), 1));
         filters.addView(favoriteButton, new LinearLayout.LayoutParams(0, dp(52), 1));
         root.addView(filters);
@@ -155,13 +201,69 @@ public class MainActivity extends Activity {
         status.setPadding(dp(4), dp(8), dp(4), dp(8));
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         root.addView(status);
-        ListView list = new ListView(this);
+        list = new ListView(this);
         list.setDividerHeight(dp(6));
+        listFooter = text("", 14, Color.LTGRAY);
+        listFooter.setGravity(Gravity.CENTER);
+        listFooter.setPadding(dp(8), dp(12), dp(8), dp(12));
+        listFooter.setOnClickListener(v -> { if (loadError) loadPage(); });
+        listFooter.setVisibility(View.GONE);
+        list.addFooterView(listFooter, null, false);
         list.setAdapter(adapter);
-        list.setOnItemClickListener((parent, view, position, id) -> play(shown.get(position)));
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < shown.size()) play(shown.get(position));
+        });
+        list.setOnScrollListener(new AbsListView.OnScrollListener() {
+            @Override public void onScrollStateChanged(AbsListView view, int state) { }
+            @Override public void onScroll(AbsListView view, int first, int visible, int total) {
+                if (visible > 0 && first + visible >= shown.size() - 6) maybeLoadMore();
+            }
+        });
         root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
-        more = button("Cargar más", v -> loadPage());
-        root.addView(more, new LinearLayout.LayoutParams(-1, dp(52)));
+        playerBar = new LinearLayout(this);
+        playerBar.setGravity(Gravity.CENTER_VERTICAL);
+        playerBar.setBackgroundColor(PANEL);
+        playerTitle = text("", 14, Color.WHITE);
+        playerTitle.setPadding(dp(8), dp(6), dp(4), dp(6));
+        playerTitle.setMaxLines(2);
+        playerBar.addView(playerTitle, new LinearLayout.LayoutParams(0, -2, 1));
+        playerToggle = iconButton(R.drawable.ic_pause, "Pausar", v -> {
+            if (playback == null) return;
+            if (playback.playing()) playback.pause(true); else playback.resume();
+        });
+        playerBar.addView(playerToggle, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        playerBar.addView(iconButton(R.drawable.ic_stop, "Detener", v -> {
+            if (playback != null) playback.stopPlayback();
+        }), new LinearLayout.LayoutParams(dp(48), dp(48)));
+        playerBar.setVisibility(View.GONE);
+        root.addView(playerBar, new LinearLayout.LayoutParams(-1, dp(64)));
+    }
+
+    private void updatePlayer() {
+        if (playerBar == null) return;
+        if (playback == null || !playback.hasStation()) {
+            playerBar.setVisibility(View.GONE);
+            return;
+        }
+        playerBar.setVisibility(View.VISIBLE);
+        playerTitle.setText(playback.title() + "\n" + playback.status());
+        playerToggle.setImageResource(playback.playing() ? R.drawable.ic_pause : R.drawable.ic_play);
+        playerToggle.setContentDescription(playback.playing() ? "Pausar" : "Reproducir");
+    }
+
+    @Override protected void onStart() {
+        super.onStart();
+        bound = bindService(new Intent(this, PlaybackService.class), connection, BIND_AUTO_CREATE);
+    }
+
+    @Override protected void onStop() {
+        if (bound) {
+            if (playback != null) playback.observe(null);
+            unbindService(connection);
+            bound = false;
+            playback = null;
+        }
+        super.onStop();
     }
 
     private void submitSearch() {
@@ -178,7 +280,10 @@ public class MainActivity extends Activity {
         offset = 0;
         shown.clear();
         hasMore = false;
+        loadError = false;
+        listFooter.setVisibility(View.GONE);
         adapter.notifyDataSetChanged();
+        list.setSelection(0);
         if (onlyFavorites) {
             String q = query.toLowerCase(Locale.ROOT);
             for (Catalog.Station s : favorites.values()) {
@@ -190,20 +295,26 @@ public class MainActivity extends Activity {
             }
             adapter.notifyDataSetChanged();
             status.setText(shown.size() + " favoritos · filtros de país y género activos");
-            more.setVisibility(View.GONE);
         } else {
             loadPage();
         }
     }
 
+    private void maybeLoadMore() {
+        if (!onlyFavorites && !loading && hasMore && !loadError) loadPage();
+    }
+
     private void loadPage() {
         if (loading || onlyFavorites) return;
         loading = true;
+        loadError = false;
         final int token = generation, start = offset;
         final String c = country, q = query, t = tag;
-        status.setText("Consultando Radio Browser…");
-        more.setVisibility(View.VISIBLE);
-        more.setEnabled(false);
+        if (shown.isEmpty()) status.setText("Consultando Radio Browser…");
+        listFooter.setText("Cargando emisoras…");
+        listFooter.setContentDescription(null);
+        listFooter.setEnabled(false);
+        listFooter.setVisibility(View.VISIBLE);
         network.execute(() -> {
             try {
                 Catalog.Page page = catalog.search(c, q, t, start);
@@ -217,20 +328,33 @@ public class MainActivity extends Activity {
                     loading = false;
                     adapter.notifyDataSetChanged();
                     status.setText(shown.isEmpty() ? "Sin resultados. Prueba otro país, género o nombre."
-                            : shown.size() + " emisoras · operativas según Radio Browser");
-                    more.setText("Cargar más");
-                    more.setEnabled(true);
-                    more.setVisibility(hasMore ? View.VISIBLE : View.GONE);
+                            : shown.size() + " emisoras cargadas · operativas según Radio Browser");
+                    if (hasMore) {
+                        listFooter.setVisibility(View.GONE);
+                        list.post(() -> {
+                            if (generation == token && (shown.isEmpty()
+                                    || (list.getChildCount() > 0
+                                    && list.getLastVisiblePosition() >= shown.size() - 6))) maybeLoadMore();
+                        });
+                    } else if (shown.isEmpty()) {
+                        listFooter.setVisibility(View.GONE);
+                    } else {
+                        listFooter.setText("No hay más emisoras");
+                        listFooter.setEnabled(false);
+                        listFooter.setVisibility(View.VISIBLE);
+                    }
                 });
             } catch (IOException | JSONException e) {
                 Log.e("RadioExplorer", "Station search failed", e);
                 ui.post(() -> {
                     if (destroyed || generation != token) return;
                     loading = false;
+                    loadError = true;
                     status.setText("No se pudo cargar la lista. Revisa tu conexión y pulsa Reintentar.");
-                    more.setVisibility(View.VISIBLE);
-                    more.setText("Reintentar");
-                    more.setEnabled(true);
+                    listFooter.setText("Reintentar");
+                    listFooter.setContentDescription("Reintentar la carga de emisoras");
+                    listFooter.setEnabled(true);
+                    listFooter.setVisibility(View.VISIBLE);
                 });
             }
         });
@@ -301,21 +425,13 @@ public class MainActivity extends Activity {
     }
 
     private void play(Catalog.Station s) {
-        Intent intent = new Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(s.url), "audio/*");
-        intent.putExtra("title", s.name);
-        intent.setPackage("org.videolan.vlc");
-        try {
-            startActivity(intent);
-        } catch (ActivityNotFoundException e) {
-            intent.setPackage(null);
-            try {
-                startActivity(intent);
-            } catch (ActivityNotFoundException noPlayer) {
-                new AlertDialog.Builder(this).setMessage("Instala VLC u otro reproductor de audio para escuchar emisoras.")
-                        .setPositiveButton("Aceptar", null).show();
-                return;
-            }
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
         }
+        Intent intent = new Intent(this, PlaybackService.class).setAction(PlaybackService.PLAY)
+                .putExtra(PlaybackService.EXTRA_NAME, s.name).putExtra(PlaybackService.EXTRA_URL, s.url);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(intent); else startService(intent);
         network.execute(() -> {
             try {
                 catalog.click(s.id);
@@ -330,12 +446,29 @@ public class MainActivity extends Activity {
                 .setMessage("Catálogo público de Radio Browser (radio-browser.info).\n\n"
                         + "Se ocultan las emisoras que su última comprobación marca como caídas. "
                         + "No es una garantía de disponibilidad: una emisión puede fallar después o estar bloqueada en tu región.\n\n"
-                        + "VLC reproduce el audio, también con la pantalla apagada. Los favoritos se guardan en este móvil.\n\n"
+                        + "LibVLC reproduce el audio dentro de la app, también con la pantalla apagada. Los favoritos se guardan en este móvil.\n\n"
                         + "La app consulta Radio Browser y notifica a su API qué emisora se abre para su contador público de escuchas. "
                         + "El proveedor y las emisoras reciben tu IP al conectar. Esta app no añade analítica ni anuncios.\n\n"
                         + "No alojamos emisiones ni somos responsables del contenido de terceros. "
-                        + "El usuario debe respetar la legislación aplicable. Software MIT, sin garantía. Creado con ayuda de IA.")
-                .setPositiveButton("Aceptar", null).show();
+                        + "El usuario debe respetar la legislación aplicable. App MIT; LibVLC LGPL 2.1 o posterior. Sin garantía. Creado con ayuda de IA.")
+                .setPositiveButton("Aceptar", null)
+                .setNeutralButton("Licencia LibVLC", (dialog, which) -> showLibraryLicense())
+                .show();
+    }
+
+    private void showLibraryLicense() {
+        try (InputStream input = getAssets().open("licenses/LGPL-2.1.txt");
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+            new AlertDialog.Builder(this).setTitle("LibVLC — LGPL 2.1")
+                    .setMessage(output.toString("UTF-8")).setPositiveButton("Cerrar", null).show();
+        } catch (IOException e) {
+            Log.e("RadioExplorer", "Cannot read LibVLC license", e);
+            new AlertDialog.Builder(this).setMessage("No se pudo abrir la licencia de LibVLC.")
+                    .setPositiveButton("Aceptar", null).show();
+        }
     }
 
     private final class StationAdapter extends BaseAdapter {
@@ -366,12 +499,12 @@ public class MainActivity extends Activity {
                 labels.addView(tags);
             }
             row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
-            Button star = button(favorites.containsKey(s.id) ? "★" : "☆", v -> toggleFavorite(s));
-            star.setFocusable(false);
-            star.setTextSize(25);
-            star.setTextColor(ACCENT);
-            star.setContentDescription((favorites.containsKey(s.id) ? "Quitar de favoritos: " : "Añadir a favoritos: ") + s.name);
-            row.addView(star, new LinearLayout.LayoutParams(dp(56), dp(56)));
+            boolean favorite = favorites.containsKey(s.id);
+            ImageButton heart = iconButton(favorite ? R.drawable.ic_favorite_on : R.drawable.ic_favorite_off,
+                    (favorite ? "Quitar de favoritos: " : "Añadir a favoritos: ") + s.name,
+                    v -> toggleFavorite(s));
+            heart.setFocusable(false);
+            row.addView(heart, new LinearLayout.LayoutParams(dp(48), dp(48)));
             return row;
         }
     }
